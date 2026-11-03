@@ -33,6 +33,7 @@ struct mt7603_mcu_rxd {
 };
 
 #define MCU_PKT_ID		0xa0
+#define MCU_EVENT_EXT		0xed
 #define MCU_PORT_QUEUE		0x8000
 #define MCU_PORT_QUEUE_FW	0xc000
 

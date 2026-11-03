@@ -19,6 +19,8 @@ mt7603_mcu_parse_response(struct mt76_dev *mdev, int cmd,
 {
 	struct mt7603_dev *dev = container_of(mdev, struct mt7603_dev, mt76);
 	struct mt7603_mcu_rxd *rxd;
+	const u8 *result;
+	u32 status;
 
 	if (!skb) {
 		dev_err(mdev->dev, "MCU message %02x (seq %d) timed out\n",
@@ -32,6 +34,32 @@ mt7603_mcu_parse_response(struct mt76_dev *mdev, int cmd,
 	rxd = (struct mt7603_mcu_rxd *)skb->data;
 	if (seq != rxd->seq)
 		return -EAGAIN;
+
+	if (is_mt7628(dev) &&
+	    (cmd == MCU_EXT_CMD_CHANNEL_SWITCH ||
+	     cmd == MCU_EXT_CMD_SET_TX_POWER_CTRL ||
+	     cmd == MCU_EXT_CMD_EFUSE_BUFFER_MODE)) {
+		dev_info(mdev->dev,
+			 "txpower-diag: cmd=%02x phase=reply eid=%02x ext_eid=%02x len=%u\n",
+			 cmd, rxd->eid, rxd->ext_eid, skb->len);
+		if (rxd->eid != MCU_EVENT_EXT ||
+		    rxd->ext_eid != MCU_EXT_EVENT_CMD_RESULT)
+			return 0;
+
+		/* Extended result: command byte, three reserved bytes, LE status. */
+		if (skb->len < sizeof(*rxd) + 8)
+			return -EPROTO;
+
+		result = skb->data + sizeof(*rxd);
+		status = get_unaligned_le32(result + 4);
+		dev_info(mdev->dev,
+			 "txpower-diag: cmd=%02x phase=firmware fw_cid=%02x fw_status=%u len=%u\n",
+			 cmd, result[0], status, skb->len);
+		if (result[0] != cmd)
+			return -EPROTO;
+		if (status)
+			return -EIO;
+	}
 
 	return 0;
 }
@@ -372,6 +400,7 @@ static int mt7603_mcu_set_tx_power(struct mt7603_dev *dev)
 #undef EEP_VAL
 	};
 	u8 *eep = (u8 *)dev->mt76.eeprom.data;
+	int i, ret;
 
 	memcpy(req.rate_power_delta, eep + MT_EE_TX_POWER_CCK,
 	       sizeof(req.rate_power_delta));
@@ -379,8 +408,38 @@ static int mt7603_mcu_set_tx_power(struct mt7603_dev *dev)
 	memcpy(req.temp_comp_power, eep + MT_EE_STEP_NUM_NEG_6_7,
 	       sizeof(req.temp_comp_power));
 
-	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_TX_POWER_CTRL,
-				 &req, sizeof(req), true);
+	if (is_mt7628(dev)) {
+		for (i = 0; i < ARRAY_SIZE(req.target_power); i++) {
+			u8 *target = &req.target_power[i];
+			int calibrated = *target & ~BIT(7);
+			int limit = dev->mphy.txpower_cur;
+
+			if (calibrated & BIT(6))
+				calibrated = -(calibrated & GENMASK(5, 0));
+			if (calibrated <= limit)
+				continue;
+
+			*target = (*target & BIT(7)) |
+				  (limit < 0 ? BIT(6) | -limit : limit);
+		}
+	}
+
+	if (is_mt7628(dev))
+		dev_info(dev->mt76.dev,
+			 "txpower-diag: cmd=11 phase=send ch=%u eep_target_raw=%02x/%02x target_raw=%02x/%02x cap_half_dbm=%d\n",
+			 req.center_channel,
+			 eep[MT_EE_TX_POWER_0_START_2G + 2],
+			 eep[MT_EE_TX_POWER_1_START_2G + 2],
+			 req.target_power[0], req.target_power[1],
+			 dev->mphy.txpower_cur);
+
+	ret = mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_TX_POWER_CTRL,
+			      &req, sizeof(req), true);
+	if (is_mt7628(dev))
+		dev_info(dev->mt76.dev,
+			 "txpower-diag: cmd=11 phase=done ret=%d\n", ret);
+
+	return ret;
 }
 
 int mt7603_mcu_set_channel(struct mt7603_dev *dev)
@@ -404,7 +463,7 @@ int mt7603_mcu_set_channel(struct mt7603_dev *dev)
 		.tx_streams = n_chains,
 		.rx_streams = n_chains,
 	};
-	s8 tx_power = hw->conf.power_level * 2;
+	int tx_power = hw->conf.power_level * 2;
 	int i, ret;
 
 	if (dev->mphy.chandef.width == NL80211_CHAN_WIDTH_40) {
@@ -418,15 +477,25 @@ int mt7603_mcu_set_channel(struct mt7603_dev *dev)
 	tx_power = mt76_get_sar_power(&dev->mphy, chandef->chan, tx_power);
 	if (dev->mphy.antenna_mask == 3)
 		tx_power -= 6;
-	tx_power = min(tx_power, dev->tx_power_limit);
+	tx_power = min_t(int, tx_power, dev->tx_power_limit);
+	if (is_mt7628(dev) && tx_power < -63)
+		return -ERANGE;
 
 	dev->mphy.txpower_cur = tx_power;
 
 	for (i = 0; i < ARRAY_SIZE(req.txpower); i++)
 		req.txpower[i] = tx_power;
 
+	if (is_mt7628(dev))
+		dev_info(dev->mt76.dev,
+			 "txpower-diag: cmd=08 phase=send ch=%u bw=%u requested_dbm=%d cap_half_dbm=%d\n",
+			 req.center_chan, req.bw, hw->conf.power_level, tx_power);
+
 	ret = mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_CHANNEL_SWITCH, &req,
 				sizeof(req), true);
+	if (is_mt7628(dev))
+		dev_info(dev->mt76.dev,
+			 "txpower-diag: cmd=08 phase=done ret=%d\n", ret);
 	if (ret)
 		return ret;
 
