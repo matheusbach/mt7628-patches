@@ -417,28 +417,13 @@ static int mt7603_mcu_set_tx_power(struct mt7603_dev *dev)
 	       sizeof(req.temp_comp_power));
 
 	if (is_mt7628(dev)) {
-		/*
-		 * MT7628: mirror the OEM host driver's CMD11 target encoding.
-		 * The OEM decodes each EEPROM power byte as signed-magnitude
-		 * with bit 6 inverted vs mt76 (bit6=1 → positive, bit6=0 →
-		 * negative) and treats bit7=0 as an invalid field (no target
-		 * defined, MCU keeps its factory default). Apply the same
-		 * current limit (txpower_cur) as mt76 so regulatory/SAR limits
-		 * are still honoured.
-		 */
 		for (i = 0; i < ARRAY_SIZE(req.target_power); i++) {
 			u8 *target = &req.target_power[i];
-			u8 raw = *target;
-			int calibrated = raw & ~BIT(7);
+			int calibrated = *target & ~BIT(7);
 			int limit = dev->mphy.txpower_cur;
 
-			if (!(raw & BIT(7)))
-				continue; /* OEM: bit7 clear = invalid field */
-
-			/* OEM: bit6 = 1 → positive, bit6 = 0 → negative */
-			if (!(calibrated & BIT(6)))
+			if (calibrated & BIT(6))
 				calibrated = -(calibrated & GENMASK(5, 0));
-
 			if (calibrated <= limit)
 				continue;
 
