@@ -7,6 +7,14 @@
 
 #define MCU_SKB_RESERVE	8
 
+/* The diagnostic/extended result parser checks for MCU event 0xed
+ * (MCU_EVENT_EXT) on MT7628. This symbol is exposed to other mt76
+ * drivers but not to mt7603 in the 0936617d headers, so define it here
+ * when missing. */
+#ifndef MCU_EVENT_EXT
+#define MCU_EVENT_EXT	0xed
+#endif
+
 struct mt7603_fw_trailer {
 	char fw_ver[10];
 	char build_date[15];
@@ -483,13 +491,26 @@ int mt7603_mcu_set_channel(struct mt7603_dev *dev)
 
 	dev->mphy.txpower_cur = tx_power;
 
-	for (i = 0; i < ARRAY_SIZE(req.txpower); i++)
-		req.txpower[i] = tx_power;
+	/*
+	 * MT7628: mirror the OEM host driver's CMD08 body. The OEM sends 0xff in
+	 * offsets 12-32 (the txpower array) while mt76 normally fills it with the
+	 * current target. RF comparison against the original firmware confirmed
+	 * that the 0xff body restores the expected range, whereas the calculated
+	 * target leaves the radio underpowered regardless of the configured
+	 * txpower. Command 11 (mt7603_mcu_set_tx_power) still carries the capped
+	 * per-chain targets so regulatory/SAR limits are honoured.
+	 */
+	if (is_mt7628(dev))
+		memset(req.txpower, 0xff, ARRAY_SIZE(req.txpower));
+	else
+		for (i = 0; i < ARRAY_SIZE(req.txpower); i++)
+			req.txpower[i] = tx_power;
 
 	if (is_mt7628(dev))
 		dev_info(dev->mt76.dev,
-			 "txpower-diag: cmd=08 phase=send ch=%u bw=%u requested_dbm=%d cap_half_dbm=%d\n",
-			 req.center_chan, req.bw, hw->conf.power_level, tx_power);
+			 "txpower-diag: cmd=08 phase=send ch=%u bw=%u requested_dbm=%d cap_half_dbm=%d oem_body=%d\n",
+			 req.center_chan, req.bw, hw->conf.power_level, tx_power,
+			 is_mt7628(dev));
 
 	ret = mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_CHANNEL_SWITCH, &req,
 				sizeof(req), true);
